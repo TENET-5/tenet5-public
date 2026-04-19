@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2024-2026 Daniel Perry. All Rights Reserved.
 # Licensed under EOSL-2.0.
-# Modified: 2026-04-19T15:20:00Z | Author: claude_code | Change: add api.health + api.status_brief; extend DAEMONS roster to 16
+# Modified: 2026-04-19T18:00:00Z | Author: claude_code | Change: Grok-review round 4 — check_process retries 3x to defend against TOCTOU during supervisor respawn
 """LIRIL Prove-All — Comprehensive Verification of the 24/7 Stack.
 
 User directive: "continue and prove all."
@@ -180,13 +180,25 @@ async def _nats_request(subject: str, payload: bytes, timeout: float = 5.0) -> d
 # ─────────────────────────────────────────────────────────────────────
 
 def check_process(name: str) -> tuple[bool, str]:
-    """Verify the supervisor's pidfile points to a live PID."""
+    """Verify the supervisor's pidfile points to a live PID.
+
+    Grok-review round 4 fix (2026-04-19): TOCTOU defence. Supervisor can
+    restart a daemon between our _read_pidfile() and _pid_alive(), causing
+    a spurious FAIL. Retry up to 3 times with 1-second gap — a daemon
+    respawn completes well inside that window, and a truly-dead daemon
+    will still be dead on the third read."""
+    for attempt in range(3):
+        pid = _read_pidfile(name)
+        if pid is not None and _pid_alive(pid):
+            return True, f"pid={pid} alive"
+        if attempt < 2:
+            import time as _t
+            _t.sleep(1.0)
+    # Third attempt failed
     pid = _read_pidfile(name)
     if pid is None:
-        return False, f"no pidfile at data/liril_supervisor/{name}.pid"
-    if not _pid_alive(pid):
-        return False, f"pidfile says pid={pid} but process is not alive"
-    return True, f"pid={pid} alive"
+        return False, f"no pidfile at data/liril_supervisor/{name}.pid (3 attempts)"
+    return False, f"pidfile says pid={pid} but not alive (3 attempts over 2s)"
 
 
 # —— Cap-specific functional checks ——

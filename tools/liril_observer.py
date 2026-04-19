@@ -141,7 +141,13 @@ def _utc() -> str:
 
 def _db() -> sqlite3.Connection:
     OBSERVER_DB.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(OBSERVER_DB))
+    conn = sqlite3.connect(str(OBSERVER_DB), timeout=15)
+    # Grok-review round 4 (2026-04-19): observer writes on 30+ subjects
+    # concurrently — without WAL this is the single biggest concurrency
+    # bomb in the stack. WAL is file-persistent: set once, keeps.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=15000")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS events (
             id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -287,14 +293,46 @@ async def _ingest_event(subject: str, payload: dict, raw_bytes: int) -> None:
     SUB_COUNTS[subject] += 1
     summary = _summarise(subject, payload)
     ts = int(time.time())
-    conn = _db()
-    conn.execute(
-        "INSERT INTO events (ts, subject, summary, body_bytes, payload) VALUES (?, ?, ?, ?, ?)",
-        (ts, subject, summary, raw_bytes,
-         json.dumps(payload, default=str)[:4000]),
-    )
-    conn.commit()
-    conn.close()
+    # Grok-review round 4 fix: retry the INSERT on 'database is locked'
+    # errors. Under load (30+ subjects firing into one sqlite db) this
+    # does happen even with WAL, briefly. Exponential backoff: 3 attempts.
+    payload_json = json.dumps(payload, default=str)[:4000]
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            conn = _db()
+            try:
+                conn.execute(
+                    "INSERT INTO events (ts, subject, summary, body_bytes, payload) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (ts, subject, summary, raw_bytes, payload_json),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            last_exc = None
+            break
+        except sqlite3.OperationalError as e:
+            last_exc = e
+            # Exponential backoff: 50ms, 150ms, 450ms
+            import asyncio as _asyncio
+            await _asyncio.sleep(0.05 * (3 ** attempt))
+        except Exception as e:
+            last_exc = e
+            break
+    if last_exc is not None:
+        # Still failed after retries — write to a fallback jsonl so we
+        # don't lose the event entirely.
+        try:
+            with open(OBSERVER_DB.parent / "observer_fallback.jsonl",
+                      "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "ts": ts, "subject": subject, "summary": summary,
+                    "body_bytes": raw_bytes, "payload": payload_json,
+                    "sqlite_error": str(last_exc)[:200],
+                }, default=str) + "\n")
+        except Exception:
+            pass
     RECENT.appendleft({
         "ts": ts,
         "iso": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
