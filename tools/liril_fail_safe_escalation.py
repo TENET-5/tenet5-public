@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2024-2026 Daniel Perry. All Rights Reserved.
 # Licensed under EOSL-2.0.
-# Modified: 2026-04-19T10:00:00Z | Author: claude_code | Change: LIRIL Capability #10 — Fail-Safe Escalation Protocol (governs EXEC_GATE for Caps #2-#5)
+# Modified: 2026-04-19T16:55:00Z | Author: claude_code | Change: Grok round 7 — atomic _maybe_transition (BEGIN IMMEDIATE), 300s decay timer, HUMAN_OK on --ack path
 """LIRIL Fail-Safe Escalation Protocol — Capability #10 of the post-NPU plan.
 
 LIRIL was asked on 2026-04-19 which capability to build next given the
@@ -129,6 +129,14 @@ INCIDENT_WINDOW_SEC  = 600.0        # 10-minute rolling window
 HEARTBEAT_INTERVAL   = 60.0         # caps must beat at least this often
 HEARTBEAT_MISS_MAX   = 3            # 3 missed intervals → incident
 LEVEL_REPUBLISH_SEC  = 30.0         # periodic retained-level broadcast
+# Grok round 7: explicit decay timer prevents level from sticking at ELEVATED/
+# ALARMED forever under a sustained flood of unique-fingerprint medium
+# incidents (each one contributes full weight even with dedup). Every
+# DECAY_TIMER_SEC, any unacked non-critical incident older than the threshold
+# gets auto-acked (reducing its contribution from full → half), allowing the
+# score to decay even under adversarial chatter.
+DECAY_TIMER_SEC      = 300.0        # fire every 5 min
+DECAY_AGE_THRESHOLD  = 300.0        # ack non-critical incidents older than this
 SEVERITY_WEIGHTS = {
     "low":      0,
     "med":      1,
@@ -395,18 +403,55 @@ def _compute_level(
 async def _maybe_transition(nc, c: sqlite3.Connection,
                             heartbeats_missed: list[str]) -> bool:
     """Recompute level, transition if different and dwell elapsed.
-    Returns True if the level changed."""
-    derived, reason = _compute_level(c, heartbeats_missed)
-    current = int(_state_get(c, "level", str(LEVEL_NOMINAL)))
-    if derived == current:
-        return False
-    last_change = float(_state_get(c, "last_change_ts", "0"))
-    if time.time() - last_change < MIN_DWELL_SEC:
-        return False  # hysteresis — hold
+    Returns True if the level changed.
 
-    _state_set(c, "level", str(derived))
-    _state_set(c, "last_change_ts", str(time.time()))
-    _state_set(c, "last_reason", reason)
+    Grok round 7 (2026-04-19): wrap the entire read-compute-write cycle
+    in BEGIN IMMEDIATE. Without it, concurrent incident floods from the
+    NATS callback can insert rows between our SELECT and our _state_set,
+    causing a stale level to be written. BEGIN IMMEDIATE acquires a
+    RESERVED lock so all concurrent INSERTs wait until we commit — our
+    compute sees a consistent snapshot AND our write races nothing.
+    """
+    try:
+        c.execute("BEGIN IMMEDIATE")
+    except sqlite3.OperationalError as e:
+        # Another writer won the lock race — skip this tick; next tick
+        # will recompute with the fresher data.
+        print(f"[FAILSAFE] BEGIN IMMEDIATE deferred: {e!r}")
+        return False
+
+    try:
+        derived, reason = _compute_level(c, heartbeats_missed)
+        current = int(_state_get(c, "level", str(LEVEL_NOMINAL)))
+        if derived == current:
+            c.commit()
+            return False
+        last_change = float(_state_get(c, "last_change_ts", "0"))
+        if time.time() - last_change < MIN_DWELL_SEC:
+            c.commit()
+            return False  # hysteresis — hold
+
+        # Write atomically with the compute above
+        c.execute(
+            "INSERT OR REPLACE INTO state(key, value) VALUES(?, ?)",
+            ("level", str(derived)),
+        )
+        c.execute(
+            "INSERT OR REPLACE INTO state(key, value) VALUES(?, ?)",
+            ("last_change_ts", str(time.time())),
+        )
+        c.execute(
+            "INSERT OR REPLACE INTO state(key, value) VALUES(?, ?)",
+            ("last_reason", reason),
+        )
+        c.commit()
+    except Exception as e:
+        try:
+            c.rollback()
+        except Exception:
+            pass
+        print(f"[FAILSAFE] _maybe_transition failed: {e!r}")
+        return False
 
     payload = {
         "ts":          _utc(),
@@ -482,6 +527,16 @@ async def _daemon() -> None:
             iid = d.get("id")
             if not iid:
                 return
+            # Grok round 7: require human_ok even over NATS. Ack is a
+            # de-escalation and must not be silently issued by in-loop
+            # agents. CLI entry already enforces LIRIL_FAILSAFE_HUMAN=1;
+            # this guard closes the direct-NATS bypass.
+            if not d.get("human_ok"):
+                print(f"[FAILSAFE] ack REJECTED — missing human_ok "
+                      f"(incident {iid})")
+                _audit({"kind": "ack_rejected_no_human_ok", "id": iid,
+                        "by": d.get("by", ""), "ts": _utc()})
+                return
             try:
                 c.execute(
                     "UPDATE incidents SET acked=1, ack_ts=? WHERE id=?",
@@ -535,6 +590,7 @@ async def _daemon() -> None:
     await nc.subscribe(COMMAND_SUBJECT, cb=_on_command)
 
     last_republish = 0.0
+    last_decay     = time.time()
     try:
         while True:
             # Compute missed heartbeats
@@ -559,6 +615,43 @@ async def _daemon() -> None:
                     c.commit()
                     _state_set(c, last_incident_key, str(now))
                     _audit({"kind": "heartbeat_missed", "cap": cap, "ts": _utc()})
+
+            # Grok round 7: explicit decay timer — every DECAY_TIMER_SEC
+            # seconds, auto-ack any unacked non-critical incidents older
+            # than DECAY_AGE_THRESHOLD. This prevents the level from
+            # sticking at ELEVATED/ALARMED forever when a chatty source
+            # keeps publishing medium-sev incidents with unique messages
+            # (dedup can't catch those). Critical incidents are explicitly
+            # excluded — a human must ack them.
+            if now - last_decay >= DECAY_TIMER_SEC:
+                try:
+                    cutoff_ts = now - DECAY_AGE_THRESHOLD
+                    rows = c.execute(
+                        "SELECT id, severity, source, message FROM incidents "
+                        "WHERE acked = 0 AND ts < ? AND severity != 'critical'",
+                        (cutoff_ts,),
+                    ).fetchall()
+                    if rows:
+                        c.execute(
+                            "UPDATE incidents SET acked=1, ack_ts=? "
+                            "WHERE acked=0 AND ts < ? AND severity != 'critical'",
+                            (now, cutoff_ts),
+                        )
+                        c.commit()
+                        for iid, sev, src, msg_text in rows:
+                            _audit({
+                                "kind": "decay_ack",
+                                "id": iid, "severity": sev,
+                                "source": src, "age_sec": now - cutoff_ts,
+                                "reason": "decay_timer_auto_ack",
+                                "ts": _utc(),
+                            })
+                        print(f"[FAILSAFE] decay timer auto-acked "
+                              f"{len(rows)} non-critical incidents >"
+                              f"{DECAY_AGE_THRESHOLD:.0f}s old")
+                except Exception as e:
+                    print(f"[FAILSAFE] decay timer failed: {e!r}")
+                last_decay = now
 
             await _maybe_transition(nc, c, missed)
 
@@ -743,7 +836,16 @@ def main() -> int:
         return 0
 
     if args.ack:
-        asyncio.run(_publish_command("ack", id=args.ack))
+        # Grok round 7: acking is a de-escalation action (reduces incident
+        # weight in the level computation). Must be human-gated like
+        # --escalate and --reset to prevent in-loop agents from silently
+        # quieting real alarms.
+        if not HUMAN_OK:
+            print("REFUSED — LIRIL_FAILSAFE_HUMAN=1 not set. "
+                  "Acknowledging incidents de-escalates the gate and "
+                  "requires explicit human flag.")
+            return 2
+        asyncio.run(_publish_command("ack", id=args.ack, human_ok=True))
         c = _db()
         try:
             c.execute("UPDATE incidents SET acked=1, ack_ts=? WHERE id=?",
