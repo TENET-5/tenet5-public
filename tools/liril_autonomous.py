@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2024-2026 Daniel Perry. All Rights Reserved.
 # Licensed under EOSL-2.0.
-# Modified: 2026-04-19T16:50:00Z | Author: claude_code | Change: add active_goals job — auto-advances liril_goals on a 10-min cadence
+# Modified: 2026-04-19T17:10:00Z | Author: claude_code | Change: Grok-review fix — per-job asyncio.Lock prevents overlap across ticks
 """LIRIL Autonomous — runs website-dev + OSINT cycles on behalf of the CEO.
 
 CEO directive (2026-04-19):
@@ -730,6 +730,19 @@ _JOB_BY_NAME = {j.name: j for j in JOBS}
 _start_ts = time.time()
 _tick_count = 0
 
+# Grok-review fix (2026-04-19): per-job asyncio.Lock prevents the same
+# job firing twice if a prior invocation is still running (e.g. a slow
+# WU search holding up gov_osint for >60s while the next tick arrives).
+_job_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_job_lock(name: str) -> asyncio.Lock:
+    lk = _job_locks.get(name)
+    if lk is None:
+        lk = asyncio.Lock()
+        _job_locks[name] = lk
+    return lk
+
 
 async def _tick(nc, dry_run: bool) -> dict:
     global _tick_count
@@ -757,6 +770,14 @@ async def _tick(nc, dry_run: bool) -> dict:
             results.append({"job": job.name, "skipped": "commit_rate_cap"})
             continue
 
+        # Grok-review fix (2026-04-19): per-job lock — if a prior
+        # invocation of THIS job is still running (e.g. a 60s WU search
+        # crossing a 60s tick boundary), skip rather than fire in parallel.
+        job_lock = _get_job_lock(job.name)
+        if job_lock.locked():
+            results.append({"job": job.name, "skipped": "already_running"})
+            continue
+
         # Journal start
         start_id = _journal_remember(
             key=f"autonomous.job.start.{job.name}",
@@ -765,11 +786,12 @@ async def _tick(nc, dry_run: bool) -> dict:
                   "observation:autonomous"],
         )
 
-        # Run
-        try:
-            result = job.runner(dry_run)
-        except Exception as e:
-            result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        # Run under the per-job lock
+        async with job_lock:
+            try:
+                result = job.runner(dry_run)
+            except Exception as e:
+                result = {"ok": False, "error": f"{type(e).__name__}: {e}"}
         job.last_run_ts = now
         job.last_result = result
 

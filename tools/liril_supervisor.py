@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2024-2026 Daniel Perry. All Rights Reserved.
 # Licensed under EOSL-2.0.
-# Modified: 2026-04-19T16:10:00Z | Author: claude_code | Change: register liril_autonomous (24/7 cron: LIRIL + TENET5 OS + Docker + website + OSINT)
+# Modified: 2026-04-19T17:00:00Z | Author: claude_code | Change: Grok-review fixes — backoff jitter + supervisor self-pidfile lock
 """LIRIL Supervisor — the 24/7 keep-alive daemon for the LIRIL capability stack.
 
 Why this exists
@@ -71,6 +71,7 @@ try:
     try: import _liril_subprocess_nowindow  # noqa: F401
     except Exception: pass
 except Exception: pass
+import random
 import signal
 import subprocess
 import sys
@@ -507,7 +508,10 @@ def _schedule_restart(d: Daemon) -> None:
         except Exception as e:
             print(f"[SUPERVISOR] file_incident_local failed: {e!r}")
         return
-    st.next_allowed_start = now + st.backoff_sec
+    # Grok-review fix (2026-04-19): add jitter to backoff to prevent
+    # thundering-herd restart storms when multiple daemons die simultaneously.
+    jitter = 0.5 + random.random()   # 0.5x .. 1.5x multiplier
+    st.next_allowed_start = now + st.backoff_sec * jitter
     st.backoff_sec = min(BACKOFF_MAX, st.backoff_sec * 2.0)
 
 
@@ -594,7 +598,36 @@ async def _on_command(msg, nc) -> None:
 # MAIN LOOP
 # ─────────────────────────────────────────────────────────────────────
 
+_SUPERVISOR_SELF_PIDFILE = ROOT / "data" / "liril_supervisor" / ".supervisor.pid"
+
+
+def _acquire_supervisor_lock() -> bool:
+    """Grok-review fix (2026-04-19): prevent two supervisors fighting for
+    the same children. Write our PID to a self-pidfile; if a prior PID is
+    still alive and owns a python process with supervisor.py in its
+    cmdline, refuse to start."""
+    try:
+        if _SUPERVISOR_SELF_PIDFILE.exists():
+            try:
+                other_pid = int(_SUPERVISOR_SELF_PIDFILE.read_text(encoding="utf-8").strip())
+            except Exception:
+                other_pid = 0
+            if other_pid and _pid_alive(other_pid) and _pid_matches_script(other_pid, "liril_supervisor.py"):
+                print(f"[SUPERVISOR] another supervisor is already running pid={other_pid} — exiting")
+                return False
+            # Stale pidfile — claim it
+        _SUPERVISOR_SELF_PIDFILE.write_text(str(os.getpid()), encoding="utf-8")
+        return True
+    except Exception as e:
+        # If we can't write the pidfile, continue but log loudly
+        print(f"[SUPERVISOR] self-pidfile write failed (non-fatal): {e!r}")
+        return True
+
+
 async def _supervise() -> None:
+    # Grok-review fix (2026-04-19): leader election via self-pidfile.
+    if not _acquire_supervisor_lock():
+        return
     # Initial boot
     print(f"[SUPERVISOR] starting — {len(SUPERVISED_DAEMONS)} daemons registered")
     for d in SUPERVISED_DAEMONS:

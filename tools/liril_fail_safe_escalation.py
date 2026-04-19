@@ -336,16 +336,29 @@ def _compute_level(
       - severity-weighted incidents in the last INCIDENT_WINDOW_SEC
       - missed heartbeats
     Returns (level, reason-string).
+
+    Grok-review fix (2026-04-19): dedupe incidents by fingerprint so a
+    chatty source publishing the same (severity,source,message) 50x in
+    10 min doesn't artificially lift the level beyond what one real
+    incident would warrant. First occurrence counts full weight;
+    duplicates contribute 0.
     """
     cutoff = time.time() - INCIDENT_WINDOW_SEC
     rows = c.execute(
-        "SELECT severity, acked FROM incidents WHERE ts >= ?",
+        "SELECT severity, acked, source, message FROM incidents WHERE ts >= ?",
         (cutoff,),
     ).fetchall()
     score = 0
     by_sev: Counter = Counter()
     any_critical_unacked = False
-    for sev, acked in rows:
+    seen_fingerprints: set = set()
+    dedup_dropped = 0
+    for sev, acked, src, msg in rows:
+        fp = (sev or "", (src or "")[:64], (msg or "")[:200])
+        if fp in seen_fingerprints:
+            dedup_dropped += 1
+            continue
+        seen_fingerprints.add(fp)
         if acked:
             # Acked incidents contribute half weight — they remain evidence
             # but the operator has seen them.
