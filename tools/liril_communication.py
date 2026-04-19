@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2024-2026 Daniel Perry. All Rights Reserved.
 # Licensed under EOSL-2.0.
-# Modified: 2026-04-19T13:00:00Z | Author: claude_code | Change: LIRIL Skill — User Communication Channels (toast + TTS + intent-aware suppression)
+# Modified: 2026-04-19T17:40:00Z | Author: claude_code | Change: Grok-review round 3 — WAL + drain lock + claim-before-dispatch to prevent double-dispatch race
 """LIRIL User Communication — LIRIL's user-facing notification layer.
 
 LIRIL picked this at severity=med when asked what new skills she wanted:
@@ -93,7 +93,13 @@ DRAIN_INTERVAL   = 60.0
 # ─────────────────────────────────────────────────────────────────────
 
 def _db() -> sqlite3.Connection:
-    c = sqlite3.connect(str(STATE_DB), timeout=5)
+    c = sqlite3.connect(str(STATE_DB), timeout=15)
+    # Grok-review round 3 (2026-04-19): WAL mode + busy_timeout so the
+    # deferred-queue drain + concurrent NATS notify don't collide on
+    # dedup writes.
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA synchronous=NORMAL")
+    c.execute("PRAGMA busy_timeout=15000")
     c.execute("""
         CREATE TABLE IF NOT EXISTS dedup (
             hash     TEXT PRIMARY KEY,
@@ -336,30 +342,65 @@ def dispatch_notify(severity: str, title: str, body: str,
     return result
 
 
+_DRAIN_LOCK = __import__("threading").Lock()
+
+
 def drain_deferred() -> int:
-    """Re-attempt all deferred items. Returns number sent."""
-    c = _db()
+    """Re-attempt all deferred items. Returns number sent.
+
+    Grok-review round 3 fix (2026-04-19): wrap the whole drain cycle in
+    a module-level threading.Lock AND claim each deferred row via a
+    DELETE-before-dispatch pattern so a concurrent NATS notify arriving
+    during drain can't dispatch the same hash twice. The DELETE happens
+    in a single atomic statement before we call dispatch_notify; if
+    dispatch fails we re-insert with the original ts."""
+    if not _DRAIN_LOCK.acquire(blocking=False):
+        # Another drain is already running — bail, it'll handle the queue
+        return 0
     try:
-        rows = c.execute(
-            "SELECT hash, severity, title, body FROM deferred ORDER BY ts ASC"
-        ).fetchall()
-    finally:
-        c.close()
-    sent = 0
-    for h, sev, title, body in rows:
-        intent = _current_intent()
-        if intent in ("GAMING", "MEETING") and sev != "critical":
-            continue
-        r = dispatch_notify(sev, title or "LIRIL", body or "", defer_on_busy=False)
-        if r.get("ok"):
+        c = _db()
+        try:
+            rows = c.execute(
+                "SELECT hash, severity, title, body, ts FROM deferred ORDER BY ts ASC"
+            ).fetchall()
+        finally:
+            c.close()
+        sent = 0
+        for h, sev, title, body, orig_ts in rows:
+            intent = _current_intent()
+            if intent in ("GAMING", "MEETING") and sev != "critical":
+                continue
+            # CLAIM the row first — delete before dispatch. If this succeeds
+            # we own the dispatch responsibility for this hash.
+            claimed = False
             c = _db()
             try:
-                c.execute("DELETE FROM deferred WHERE hash=?", (h,))
+                cur = c.execute("DELETE FROM deferred WHERE hash=?", (h,))
+                claimed = cur.rowcount > 0
                 c.commit()
             finally:
                 c.close()
-            sent += 1
-    return sent
+            if not claimed:
+                # Someone else already took it
+                continue
+            r = dispatch_notify(sev, title or "LIRIL", body or "", defer_on_busy=False)
+            if r.get("ok"):
+                sent += 1
+            else:
+                # Dispatch failed — re-insert so we try again next cycle
+                c = _db()
+                try:
+                    c.execute(
+                        "INSERT OR REPLACE INTO deferred(hash, ts, severity, title, body, reason) "
+                        "VALUES(?, ?, ?, ?, ?, ?)",
+                        (h, orig_ts, sev, title, body, "dispatch_failed_during_drain"),
+                    )
+                    c.commit()
+                finally:
+                    c.close()
+        return sent
+    finally:
+        _DRAIN_LOCK.release()
 
 
 # ─────────────────────────────────────────────────────────────────────

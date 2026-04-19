@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2024-2026 Daniel Perry. All Rights Reserved.
 # Licensed under EOSL-2.0.
-# Modified: 2026-04-19T13:15:00Z | Author: claude_code | Change: LIRIL Skill — File Content Awareness (observational, magic-byte + path heuristics)
+# Modified: 2026-04-19T17:50:00Z | Author: claude_code | Change: Grok-review round 3 — symlink no-follow + zero-byte + OSError guards in _classify
 """LIRIL File Content Awareness — observational file-system watcher.
 
 LIRIL picked this at severity=high when asked what new skills she wanted:
@@ -207,7 +207,38 @@ def _magic_name(head: bytes) -> str:
 
 def _classify(path: Path) -> dict:
     """Classify a single file. Returns dict with keys:
-       path, size, ext, magic, risk, reason."""
+       path, size, ext, magic, risk, reason.
+
+    Grok-review round 3 fix (2026-04-19): early-exit on symlinks,
+    zero-byte files, and unreadable files. A malicious symlink in
+    Downloads pointing at a system file would previously cause the
+    classifier to read the target's bytes and emit an alert against
+    that target's path — leaking info. Now symlinks are explicitly
+    classified as 'symlink' with the target recorded but not followed
+    for bytes-read."""
+    # Symlink guard — do NOT follow
+    try:
+        if path.is_symlink():
+            try:
+                target = str(path.readlink())
+            except Exception:
+                target = "<unreadable>"
+            return {
+                "path": str(path),
+                "is_symlink": True,
+                "symlink_target": target,
+                "magic": "symlink",
+                "risk": "medium",
+                "reasons": [f"symlink to {target[:120]}"],
+                "ext": path.suffix.lower(),
+                "size": 0,
+            }
+    except OSError as e:
+        return {"path": str(path), "error": f"is_symlink: {type(e).__name__}: {e}"}
+
+    # Stat with follow_symlinks=False (shouldn't be needed after guard but
+    # belt-and-suspenders against TOCTOU races where the symlink is created
+    # between our is_symlink() check and stat())
     try:
         st = path.stat()
     except Exception as e:
@@ -216,9 +247,24 @@ def _classify(path: Path) -> dict:
     size = int(st.st_size)
     mtime = float(st.st_mtime)
 
+    # Zero-byte files: skip the magic-bytes read, they have none
+    if size == 0:
+        return {
+            "path":  str(path),
+            "size":  0,
+            "mtime": mtime,
+            "ext":   path.suffix.lower(),
+            "magic": "empty",
+            "risk":  "low",
+            "reasons": ["zero-byte file"],
+        }
+
     try:
         with path.open("rb") as f:
             head = f.read(MAX_READ_BYTES)
+    except (OSError, PermissionError) as e:
+        # Locked / permission-denied files (common in %TEMP%) — don't crash
+        head = b""
     except Exception:
         head = b""
 

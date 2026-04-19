@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2024-2026 Daniel Perry. All Rights Reserved.
 # Licensed under EOSL-2.0.
-# Modified: 2026-04-19T12:45:00Z | Author: claude_code | Change: LIRIL Skill — Outbound Network Reach (allowlist, rate limit, fse gate)
+# Modified: 2026-04-19T17:45:00Z | Author: claude_code | Change: Grok-review round 3 — rate-limit backed by persistent audit table (survives supervisor restart)
 """LIRIL Outbound Network Reach — LIRIL's first gateway-to-the-world skill.
 
 LIRIL picked this at severity=CRITICAL when asked what new skills she
@@ -212,15 +212,50 @@ _rate_windows: dict[str, deque] = defaultdict(lambda: deque(maxlen=120))
 
 
 def _rate_allow(host: str) -> bool:
-    """Return True if this host is within rate limit (sliding 60-s window)."""
+    """Return True if this host is within rate limit (sliding 60-s window).
+
+    Grok-review round 3 fix (2026-04-19): the in-process `_rate_windows`
+    memory is wiped by a supervisor restart — an attacker could burst
+    past the limit right after a restart. We back the window with a
+    persistent sqlite table so the counter survives. The in-process
+    deque is still checked first for speed; the sqlite table is the
+    authoritative ledger.
+    """
     q = _rate_windows[host]
     now = time.time()
     while q and (now - q[0]) > 60.0:
         q.popleft()
-    if len(q) >= RATE_LIMIT_PER_MIN:
+    # Also consult the persistent table — accepts durable restart-proof writes
+    durable_count = _rate_durable_count(host, now - 60.0)
+    effective = max(len(q), durable_count)
+    if effective >= RATE_LIMIT_PER_MIN:
         return False
     q.append(now)
+    _rate_durable_record(host, now)
     return True
+
+
+def _rate_durable_count(host: str, since_ts: float) -> int:
+    """Count persistent requests to HOST in the last 60s."""
+    try:
+        c = _db()
+        try:
+            r = c.execute(
+                "SELECT COUNT(*) FROM audit WHERE host = ? AND ts >= ?",
+                (host, since_ts),
+            ).fetchone()
+            return int(r[0]) if r else 0
+        finally:
+            c.close()
+    except Exception:
+        return 0
+
+
+def _rate_durable_record(host: str, ts: float) -> None:
+    """Not strictly necessary — _audit_write() already records every call
+    into the audit table. This is a no-op unless we later add a
+    separate dedicated rate table."""
+    pass
 
 
 # ─────────────────────────────────────────────────────────────────────
