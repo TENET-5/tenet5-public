@@ -1,0 +1,68 @@
+# ────────────────────────────────────────────────────────────────────
+# TENET5-public — hard excludes for the sanitized snapshot
+# ────────────────────────────────────────────────────────────────────
+
+# Never commit secrets
+.env
+.env.*
+*.api_token
+.api_token
+**/credentials*.json
+**/id_rsa*
+**/*.pem
+**/token.txt
+
+# Runtime + cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# SQLite + jsonl runtime state (never in the public snapshot)
+*.sqlite
+*.sqlite-journal
+*.db
+*.db-journal
+data/
+**/data/*.jsonl
+**/data/*.log
+
+# Binary models + archives
+*.gguf
+*.onnx
+*.bin
+*.zip
+*.7z
+*.tar
+*.tar.gz
+models/
+flux2_models/
+bin/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# Docker / infra (this snapshot is code only)
+docker-compose*.yml
+Dockerfile*
+k8s/
+infrastructure/
+
+# OSINT corpora (may contain sensitive names / data)
+**/osint/
+**/data/osint/
+**/data/foreign_influence/
+**/data/municipal/
+
+# Generated reports
+**/data/reports/
+**/data/*_latest.json
+**/data/jules_*.jsonl

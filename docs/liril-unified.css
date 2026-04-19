@@ -1,0 +1,275 @@
+/* ═══════════════════════════════════════════════════════════════════════
+   LIRIL UNIFIED THEME — Canonical stylesheet for TENET5
+   Modified: 2026-04-19 | claude_code | Initial unification pass
+
+   ONE stylesheet to include from every page:
+       <link rel="stylesheet" href="/css/liril-unified.css?v=1">
+
+   What this file does
+   -------------------
+   1. @imports the core stack in the correct cascade order:
+        style.css              — Red Ensign Royal Canadian base theme
+        css/polish.css         — typography + card polish
+        css/inline_generated.css — page-specific CI-generated rules
+      (Pages that need additional themes — style-slate, timeline,
+       topography, submarine-dial, film-grain, metaverse, omniverse,
+       chalkboard, premium-presentation — include them AFTER this
+       file, so unified variables are available for overrides.)
+
+   2. Exposes a canonical CSS custom-property layer under a single
+      :root{} block. Everything else on the site can reference these
+      instead of hard-coding hex values.
+
+   3. Ships unified primitives:
+        .liril-walkthrough-cta   canonical start-walkthrough button
+        .liril-badge             small status pill
+        .liril-status-dot        animated heartbeat dot
+        .liril-section-active    highlight for liril-walkthrough.js
+
+   Rules
+   -----
+     * Do NOT add page-specific styles here. Those go in inline
+       <style> blocks or in a page-specific CSS file.
+     * Do NOT change variable names once adopted. Downstream CSS
+       depends on these exact tokens.
+     * All new colour / type / spacing should be a token in this
+       file first, a declaration second.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+@import url("/style.css?v=22");
+@import url("/css/polish.css?v=1");
+@import url("/css/inline_generated.css");
+
+:root {
+  /* ── Brand colours ─────────────────────────────────────────────
+     Red Ensign Royal Canadian palette. Change these once here and
+     every downstream stylesheet that uses var() follows.
+     ───────────────────────────────────────────────────────────── */
+  --liril-ensign-red:       #c41e3a;     /* Canadian red */
+  --liril-ensign-red-deep:  #8f1228;     /* hover / pressed */
+  --liril-gold:             #d4af37;     /* heraldic gold */
+  --liril-gold-bright:      #f0cc5c;
+  --liril-navy:             #0b1220;     /* page background base */
+  --liril-navy-deep:        #07101d;
+  --liril-navy-raised:      #111a2b;     /* cards, panels */
+  --liril-navy-border:      rgba(212, 175, 55, 0.18);
+
+  /* ── Text ──────────────────────────────────────────────────── */
+  --liril-text-primary:     #ecf0f7;
+  --liril-text-secondary:   #aeb7c8;
+  --liril-text-dim:         #6b7489;
+  --liril-text-accent:      var(--liril-gold);
+
+  /* ── LIRIL-specific accents ────────────────────────────────── */
+  --liril-ai-cyan:          #22d3ee;
+  --liril-ai-quantum:       #a855f7;
+  --liril-ai-amber:         #f59e0b;
+  --liril-ai-emerald:       #10b981;
+
+  /* ── Type scale ────────────────────────────────────────────── */
+  --liril-font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI Variable",
+                     "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --liril-font-mono: "JetBrains Mono", "Fira Code", "SF Mono",
+                     Menlo, Consolas, monospace;
+  --liril-font-serif: "Iowan Old Style", "Palatino", "Times New Roman", serif;
+
+  /* ── Spacing + radii ───────────────────────────────────────── */
+  --liril-radius-sm: 6px;
+  --liril-radius-md: 10px;
+  --liril-radius-lg: 16px;
+  --liril-radius-pill: 999px;
+
+  --liril-pad-xs: 4px;
+  --liril-pad-sm: 8px;
+  --liril-pad-md: 14px;
+  --liril-pad-lg: 22px;
+  --liril-pad-xl: 32px;
+
+  /* ── Shadows ───────────────────────────────────────────────── */
+  --liril-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.25);
+  --liril-shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
+  --liril-shadow-lg: 0 12px 32px rgba(0, 0, 0, 0.55);
+  --liril-shadow-glow: 0 0 24px rgba(34, 211, 238, 0.22);
+
+  /* ── Motion ────────────────────────────────────────────────── */
+  --liril-ease-out: cubic-bezier(0.22, 0.61, 0.36, 1);
+  --liril-ease-in-out: cubic-bezier(0.65, 0.05, 0.35, 1);
+  --liril-duration-fast: 120ms;
+  --liril-duration-base: 220ms;
+  --liril-duration-slow: 420ms;
+
+  /* ── Z-index layering ──────────────────────────────────────── */
+  --liril-z-nav:        100;
+  --liril-z-overlay:    500;
+  --liril-z-walkthrough: 900;   /* above most page UI */
+  --liril-z-toast:     1000;
+}
+
+/* Respect the legacy --text-primary var that existing pages already rely on */
+:root {
+  --text-primary: var(--liril-text-primary);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   LIRIL WALKTHROUGH CANONICAL UI
+   Shared classes used by liril-walkthrough.js (v3.0+). Do not inline
+   these styles anywhere else.
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.liril-walkthrough-cta {
+  position: fixed;
+  bottom: calc(env(safe-area-inset-bottom, 0) + 22px);
+  right: 22px;
+  padding: 12px 22px;
+  border-radius: var(--liril-radius-pill);
+  background: linear-gradient(135deg,
+    var(--liril-ensign-red) 0%,
+    var(--liril-ensign-red-deep) 100%);
+  color: #fff;
+  font-family: var(--liril-font-sans);
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  box-shadow: var(--liril-shadow-lg),
+              0 0 0 4px rgba(196, 30, 58, 0.10);
+  cursor: pointer;
+  z-index: var(--liril-z-walkthrough);
+  transition: transform var(--liril-duration-fast) var(--liril-ease-out),
+              box-shadow var(--liril-duration-fast) var(--liril-ease-out);
+  user-select: none;
+}
+
+.liril-walkthrough-cta:hover,
+.liril-walkthrough-cta:focus-visible {
+  transform: translateY(-1px);
+  box-shadow: var(--liril-shadow-lg),
+              0 0 0 6px rgba(196, 30, 58, 0.18);
+  outline: none;
+}
+
+.liril-walkthrough-cta[data-state="running"] {
+  background: linear-gradient(135deg, #475569 0%, #334155 100%);
+}
+
+.liril-walkthrough-cta[data-state="running"]::before {
+  content: "■ ";
+}
+
+.liril-walkthrough-cta::before {
+  content: "▶ ";
+}
+
+/* Subtitle band rendered by liril-walkthrough.js during narration */
+.liril-walkthrough-subtitle {
+  position: fixed;
+  left: 50%;
+  bottom: calc(env(safe-area-inset-bottom, 0) + 90px);
+  transform: translateX(-50%);
+  max-width: min(900px, 92vw);
+  padding: var(--liril-pad-md) var(--liril-pad-lg);
+  background: rgba(11, 18, 32, 0.92);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid var(--liril-navy-border);
+  border-radius: var(--liril-radius-md);
+  color: var(--liril-text-primary);
+  font-family: var(--liril-font-sans);
+  font-size: 17px;
+  line-height: 1.45;
+  box-shadow: var(--liril-shadow-lg);
+  z-index: var(--liril-z-walkthrough);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity var(--liril-duration-base) var(--liril-ease-out);
+}
+
+.liril-walkthrough-subtitle[data-visible="true"] {
+  opacity: 1;
+}
+
+/* Highlight current section during narration */
+.liril-section-active {
+  position: relative;
+  transition: box-shadow var(--liril-duration-slow) var(--liril-ease-out);
+  box-shadow: 0 0 0 2px var(--liril-gold),
+              0 0 30px rgba(212, 175, 55, 0.25);
+  border-radius: var(--liril-radius-sm);
+}
+
+.liril-section-active::before {
+  content: "";
+  position: absolute;
+  inset: -4px;
+  border-radius: calc(var(--liril-radius-sm) + 4px);
+  pointer-events: none;
+  background: radial-gradient(circle at top left,
+              rgba(212, 175, 55, 0.06), transparent 60%);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   SHARED PRIMITIVES
+   ═══════════════════════════════════════════════════════════════════════ */
+
+.liril-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px;
+  border-radius: var(--liril-radius-pill);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--liril-navy-border);
+  color: var(--liril-text-secondary);
+  font-family: var(--liril-font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+}
+
+.liril-badge[data-tone="ai"] {
+  color: var(--liril-ai-cyan);
+  border-color: rgba(34, 211, 238, 0.35);
+}
+
+.liril-badge[data-tone="quantum"] {
+  color: var(--liril-ai-quantum);
+  border-color: rgba(168, 85, 247, 0.35);
+}
+
+.liril-badge[data-tone="live"] {
+  color: var(--liril-ai-emerald);
+  border-color: rgba(16, 185, 129, 0.35);
+}
+
+.liril-status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--liril-ai-emerald);
+  box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.6);
+  animation: liril-heartbeat 2s infinite var(--liril-ease-in-out);
+}
+
+@keyframes liril-heartbeat {
+  0%   { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.6); }
+  70%  { box-shadow: 0 0 0 10px rgba(16, 185, 129, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   ACCESSIBILITY / MOTION PREFERENCES
+   ═══════════════════════════════════════════════════════════════════════ */
+
+@media (prefers-reduced-motion: reduce) {
+  .liril-status-dot,
+  .liril-walkthrough-cta,
+  .liril-walkthrough-subtitle,
+  .liril-section-active {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+/* End of file. */
