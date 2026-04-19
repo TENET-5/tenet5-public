@@ -126,7 +126,14 @@ def _utc() -> str:
 # ─────────────────────────────────────────────────────────────────────
 
 def _db() -> sqlite3.Connection:
-    c = sqlite3.connect(str(DB_PATH), timeout=5)
+    c = sqlite3.connect(str(DB_PATH), timeout=15)
+    # Grok-review fix round 2 (2026-04-19): WAL mode + reasonable
+    # busy_timeout. Without this, 17 writers will trip "database is
+    # locked" under load + the LIKE fallback search path can starve.
+    # WAL is file-persistent — once set, all future opens use it too.
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA synchronous=NORMAL")
+    c.execute("PRAGMA busy_timeout=15000")
     c.execute("""
         CREATE TABLE IF NOT EXISTS entries (
             id         TEXT PRIMARY KEY,

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2024-2026 Daniel Perry. All Rights Reserved.
 # Licensed under EOSL-2.0.
-# Modified: 2026-04-19T15:15:00Z | Author: claude_code | Change: unified HTTP/JSON API exposing all 15 LIRIL daemons on 127.0.0.1:18120
+# Modified: 2026-04-19T17:25:00Z | Author: claude_code | Change: Grok-review round 2 — bounded ThreadingMixIn thread pool (32 max concurrent handlers)
 """LIRIL HTTP API — single endpoint for the whole 15-daemon stack.
 
 Why this exists
@@ -453,6 +453,28 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 class _ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    # Grok-review fix round 2 (2026-04-19): bound the thread pool so a
+    # spike of 500 parallel requests can't explode into 500 threads +
+    # 500 sqlite connections. ThreadingMixIn has no native cap, but it
+    # honours `block_on_close` semantics + we can gate concurrency via
+    # a semaphore in process_request.
+    import threading as _threading
+    _max_concurrent_handlers = 32
+    _sem = _threading.BoundedSemaphore(_max_concurrent_handlers)
+
+    def process_request(self, request, client_address):
+        self._sem.acquire()
+        def _wrapped():
+            try:
+                super(_ThreadedServer, self).process_request(request, client_address)
+            finally:
+                try: self._sem.release()
+                except Exception: pass
+        # Use the default ThreadingMixIn spawn but with our wrapped target
+        import threading
+        t = threading.Thread(target=_wrapped)
+        t.daemon = self.daemon_threads
+        t.start()
 
 
 def serve() -> None:

@@ -188,11 +188,69 @@ def _http_get(path: str, params: dict | None = None) -> dict:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
+# Grok-review fix round 2: per-route arg whitelist. Extra keys from the
+# LLM are silently dropped; values are length-capped strings only.
+# This hardens the goals engine against a maliciously crafted LLM
+# decompose response (JSON injection, shell-y args, key bloat).
+_ALLOWED_ARGS: dict[tuple[str, str], set[str]] = {
+    ("incidents", "recent"):      {"limit"},
+    ("process_manager", "top"):   {"top"},
+    ("process_manager", "processes"): {"top"},
+    ("file_awareness", "alerts"): {"limit"},
+    ("journal", "recall"):        {"key", "tag", "limit"},
+    ("journal", "search"):        {"q", "limit"},
+    # Most read routes take no args at all:
+    ("status", "get"):            set(),
+    ("status", "brief"):          set(),
+    ("failsafe", "level"):        set(),
+    ("gpu", "snapshot"):          set(),
+    ("service_control", "list"):  set(),
+    ("services", "list"):         set(),
+    ("driver_manager", "list"):   set(),
+    ("drivers", "list"):          set(),
+    ("patch_manager", "pending"): set(),
+    ("patches", "list"):          set(),
+    ("intent", "get"):            set(),
+    ("user_intent", "current"):   set(),
+    ("hardware", "gpu"):          set(),
+    ("journal", "stats"):         set(),
+    ("nats", "rates"):            set(),
+}
+
+_MAX_ARG_VALUE_LEN = 200
+
+
+def _sanitise_args(cap: str, method: str, args) -> tuple[dict, list[str]]:
+    """Filter args against the per-route whitelist + coerce to safe strings.
+    Returns (clean_params, dropped_keys)."""
+    allowed = _ALLOWED_ARGS.get((cap, method), set())
+    if not isinstance(args, dict):
+        return {}, ["<args not dict>"]
+    clean: dict = {}
+    dropped: list[str] = []
+    for k, v in args.items():
+        if not isinstance(k, str) or k not in allowed:
+            dropped.append(str(k)[:32])
+            continue
+        # Only scalar, length-capped string values
+        if not isinstance(v, (str, int, float, bool)):
+            dropped.append(f"{k}(non-scalar)")
+            continue
+        clean[k] = str(v)[:_MAX_ARG_VALUE_LEN]
+    return clean, dropped
+
+
 def _dispatch_step(step: dict) -> dict:
     """Execute ONE step. Returns the result dict written to the journal."""
+    # Grok-review fix round 2: validate the step shape BEFORE looking at
+    # any field. LLM output is untrusted.
+    if not isinstance(step, dict):
+        return {"ok": False, "error": f"refused: step is not a dict (got {type(step).__name__})"}
     cap = (step.get("cap") or "").strip().lower()
     method = (step.get("method") or "").strip().lower()
-    args = step.get("args") or {}
+    if not cap or not method:
+        return {"ok": False, "error": "refused: step missing cap or method"}
+    raw_args = step.get("args") or {}
     key = (cap, method)
     if key not in _READ_ROUTES:
         return {"ok": False, "error": f"refused: ({cap}, {method}) not in "
@@ -201,11 +259,13 @@ def _dispatch_step(step: dict) -> dict:
     verb, route = _READ_ROUTES[key]
     if verb != "GET":
         return {"ok": False, "error": "only GET supported in v1"}
-    params = {}
-    for k, v in args.items():
-        if isinstance(v, (str, int, float, bool)):
-            params[k] = str(v)
+    # Sanitise args per whitelist
+    params, dropped = _sanitise_args(cap, method, raw_args)
     r = _http_get(route, params)
+    # Record any dropped keys in the step's audit trail
+    if dropped:
+        r = dict(r)
+        r["dropped_args"] = dropped[:10]
     if not r.get("ok"):
         return r
     body = r.get("body") or {}
@@ -213,9 +273,12 @@ def _dispatch_step(step: dict) -> dict:
     if isinstance(body, dict) and "data" in body:
         data = body.get("data")
         return {"ok": bool(body.get("ok", True)),
-                "cap": cap, "method": method, "args": args,
-                "data": data}
-    return {"ok": True, "cap": cap, "method": method, "args": args, "data": body}
+                "cap": cap, "method": method, "args": params,
+                "data": data,
+                **({"dropped_args": dropped[:10]} if dropped else {})}
+    return {"ok": True, "cap": cap, "method": method, "args": params,
+            "data": body,
+            **({"dropped_args": dropped[:10]} if dropped else {})}
 
 
 # ─────────────────────────────────────────────────────────────────────

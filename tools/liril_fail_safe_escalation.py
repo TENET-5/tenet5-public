@@ -150,7 +150,11 @@ AUDIT_LOG  = DATA_DIR / "liril_failsafe_audit.jsonl"
 # ─────────────────────────────────────────────────────────────────────
 
 def _db() -> sqlite3.Connection:
-    c = sqlite3.connect(str(DB_PATH), timeout=5)
+    c = sqlite3.connect(str(DB_PATH), timeout=15)
+    # Grok-review fix round 2: WAL + busy_timeout for concurrent writers.
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA synchronous=NORMAL")
+    c.execute("PRAGMA busy_timeout=15000")
     c.execute("""
         CREATE TABLE IF NOT EXISTS state (
             key   TEXT PRIMARY KEY,
