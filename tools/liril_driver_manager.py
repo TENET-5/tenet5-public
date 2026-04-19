@@ -287,8 +287,30 @@ def _sanitize_inf(name: str) -> str:
 
 
 def _sanitize_instance_id(iid: str) -> str:
-    """Allow the characters PnP instance IDs actually use. No shell metacharacters."""
+    """Allow the characters PnP instance IDs actually use. No shell metacharacters.
+
+    Grok-review round 5 fix (2026-04-19): previously callers treated
+    this as a one-way strip. If any character was removed, downstream
+    pnputil could operate on a DIFFERENT device than the user specified.
+    Callers now use _instance_id_strict() which raises if sanitize
+    altered the input at all."""
     return re.sub(r"[^A-Za-z0-9_\-\\{}.&]", "", iid or "")
+
+
+def _instance_id_strict(iid: str) -> str:
+    """Reversibility gate: returns the input unchanged iff sanitize did
+    not alter it. Raises ValueError otherwise. Use this before any
+    pnputil dispatch where the exact InstanceId matters."""
+    raw = (iid or "").strip()
+    if not raw:
+        raise ValueError("empty instance id")
+    safe = _sanitize_instance_id(raw)
+    if safe != raw:
+        raise ValueError(
+            f"instance id contains disallowed characters; "
+            f"raw={raw!r} sanitize_result={safe!r}"
+        )
+    return raw
 
 
 def list_devices(class_filter: str | None = None) -> list[dict]:
@@ -435,9 +457,11 @@ def _make_plan(action: str, target: str, reason: str) -> dict:
         }
 
     # disable / enable / restart — target is a PnP instance id
-    safe_iid = _sanitize_instance_id(target)
-    if not safe_iid:
-        raise ValueError(f"invalid instance id {target!r}")
+    # Grok-review round 5: strict reversibility check — reject if sanitize altered the input
+    try:
+        safe_iid = _instance_id_strict(target)
+    except ValueError as e:
+        raise ValueError(f"invalid instance id: {e}")
     dev = device_state(safe_iid)
     denied = True
     if dev:

@@ -447,11 +447,31 @@ async def _wait_for_veto(nc, plan_id: str) -> dict | None:
     return got
 
 
-def _run_terminate(pid: int) -> tuple[bool, str]:
+def _run_terminate(pid: int, expected_create_time: float | None = None) -> tuple[bool, str]:
+    """Terminate a process.
+
+    Grok-review round 5 fix (2026-04-19): PID reuse defence. Windows can
+    reuse a PID in <200ms under high churn. If the caller passed the
+    process's create_time() at plan-build time, we re-validate that the
+    PID we're about to kill still has the SAME create_time. If the PID
+    has been reused, create_time will differ and we refuse with
+    'pid_reused' — better than killing a wrong unrelated process."""
     try:
         import psutil  # type: ignore
         try:
             p = psutil.Process(int(pid))
+            # PID-reuse re-check
+            if expected_create_time is not None:
+                try:
+                    actual_ct = p.create_time()
+                    if abs(actual_ct - expected_create_time) > 0.5:
+                        return False, (
+                            f"pid_reused: create_time drift "
+                            f"expected={expected_create_time:.3f} "
+                            f"actual={actual_ct:.3f}"
+                        )
+                except Exception as e:
+                    return False, f"pid_reuse_check_failed: {type(e).__name__}: {e}"
             p.terminate()
             try:
                 p.wait(timeout=3)
@@ -465,7 +485,10 @@ def _run_terminate(pid: int) -> tuple[bool, str]:
             return False, f"access denied: {e}"
     except ImportError:
         pass
-    # Fallback: taskkill
+    # Fallback: taskkill (no PID-reuse guard available via taskkill; only
+    # trip it if psutil is missing AND expected_create_time wasn't passed)
+    if expected_create_time is not None:
+        return False, "pid_reuse_guard_unavailable (psutil missing; refusing fallback)"
     try:
         r = subprocess.run(
             ["taskkill.exe", "/PID", str(int(pid)), "/F"],
@@ -524,9 +547,10 @@ def _run_suspend_resume(pid: int, action: str) -> tuple[bool, str]:
     )
 
 
-def _run_action(action: str, level: str | None, pid: int) -> tuple[bool, str]:
+def _run_action(action: str, level: str | None, pid: int,
+                expected_create_time: float | None = None) -> tuple[bool, str]:
     if action == "terminate":
-        return _run_terminate(pid)
+        return _run_terminate(pid, expected_create_time=expected_create_time)
     if action == "priority":
         return _run_priority(pid, level or "normal")
     if action in ("suspend", "resume"):
@@ -601,7 +625,11 @@ async def do_action(action_raw: str, pid: int, reason: str = "") -> dict:
             _audit({"kind": "pid_reuse", **plan})
             return plan
 
-        ok, msg = _run_action(plan["action"], plan.get("priority_level"), plan["pid"])
+        # Grok-review round 5: pass the plan's pre-veto create_time so
+        # _run_terminate can detect PID reuse during the veto window.
+        expected_ct = (plan.get("pre_state") or {}).get("create_time")
+        ok, msg = _run_action(plan["action"], plan.get("priority_level"),
+                              plan["pid"], expected_create_time=expected_ct)
         plan["status"] = "executed" if ok else "execute_failed"
         plan["result"] = msg
         _audit({"kind": "executed" if ok else "failed", **plan})
