@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2024-2026 Daniel Perry. All Rights Reserved.
 # Licensed under EOSL-2.0.
-# Modified: 2026-04-19T14:55:00Z | Author: claude_code | Change: integrate journal — pre-fire recall of past outcomes + post-action persistence
+# Modified: 2026-04-19T16:25:00Z | Author: claude_code | Change: Grok round 6 — WAL + busy_timeout on _db + LIRIL_REPAIR_FORCE env override on skip-on-3-fails
 """LIRIL Autonomous Self-Repair — Capability #6 of the post-NPU plan.
 
 LIRIL (poll 2026-04-19): "Enables automatic detection and resolution of system
@@ -125,7 +125,14 @@ def _audit(entry: dict) -> None:
 # ─────────────────────────────────────────────────────────────────────
 
 def _db() -> sqlite3.Connection:
-    c = sqlite3.connect(str(STATE_DB), timeout=5)
+    # Grok round 6: WAL + busy_timeout — Cap#6 writes coincide with global
+    # rate checks and journal lookups from multiple async tasks; a
+    # naked journal mode will throw 'database is locked' under load,
+    # which causes the rule engine to silently drop fires.
+    c = sqlite3.connect(str(STATE_DB), timeout=15)
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA synchronous=NORMAL")
+    c.execute("PRAGMA busy_timeout=15000")
     c.execute("""
         CREATE TABLE IF NOT EXISTS cooldowns (
             rule_name  TEXT PRIMARY KEY,
@@ -702,12 +709,20 @@ async def _evaluate_rule(rule: RepairRule, nc) -> dict:
     # Journal: check if THIS rule has failed repeatedly in the last 24h.
     # If so, skip the current attempt and file a severity=high fse incident
     # so a human notices that auto-repair is no longer working.
+    # --
+    # Grok round 6 (2026-04-19): this guard rail becomes weaponized against
+    # the operator during real emergencies — e.g. if disk_cleanup failed 3
+    # times last night because of a locked handle, the NEXT morning when
+    # the disk is actually full the human WANTS it to try again. Expose
+    # an explicit escape hatch via LIRIL_REPAIR_FORCE=1 (env var so it
+    # can't be set by accident through the NATS plan channel).
     past = _journal_recall_past(rule.name, limit=10)
     recent_fails = _recent_fail_count(past)
-    if recent_fails >= _JOURNAL_RECENT_FAIL_MAX:
+    force_override = os.environ.get("LIRIL_REPAIR_FORCE", "0") == "1"
+    if recent_fails >= _JOURNAL_RECENT_FAIL_MAX and not force_override:
         result["skipped"] = (
             f"journal: {recent_fails} recent failures in {_JOURNAL_LOOKBACK_SEC/3600:.0f}h — "
-            "manual intervention required"
+            "manual intervention required (set LIRIL_REPAIR_FORCE=1 to override)"
         )
         result["past_fail_count"] = recent_fails
         try:
@@ -716,7 +731,7 @@ async def _evaluate_rule(rule: RepairRule, nc) -> dict:
             _fse.file_incident_local(
                 "high", "liril_self_repair",
                 f"rule '{rule.name}' has failed {recent_fails}+ times recently — "
-                "auto-repair disabled until manual ack",
+                "auto-repair disabled until manual ack (LIRIL_REPAIR_FORCE=1 overrides)",
                 data={"rule": rule.name, "recent_fails": recent_fails},
             )
         except Exception:
@@ -724,6 +739,12 @@ async def _evaluate_rule(rule: RepairRule, nc) -> dict:
         _audit({"kind": "journal_skip_too_many_fails", "rule": rule.name,
                 "recent_fails": recent_fails, "ts": _utc()})
         return result
+    if recent_fails >= _JOURNAL_RECENT_FAIL_MAX and force_override:
+        # Humans asked to force-try. Leave a breadcrumb so post-mortems
+        # can correlate the override with the outcome.
+        result["forced_override"] = True
+        _audit({"kind": "force_override_applied", "rule": rule.name,
+                "recent_fails": recent_fails, "ts": _utc()})
     result["past_fail_count"] = recent_fails
     result["past_total"]      = len(past)
 

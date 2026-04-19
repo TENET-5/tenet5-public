@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2024-2026 Daniel Perry. All Rights Reserved.
 # Licensed under EOSL-2.0.
-# Modified: 2026-04-19T10:40:00Z | Author: claude_code | Change: LIRIL Capability #8 — Hardware Health Telemetry Aggregator (feeds Cap#10 incidents)
+# Modified: 2026-04-19T16:30:00Z | Author: claude_code | Change: Grok round 6 — WAL + busy_timeout + immediate stuck-fan override at >=90°C (bypass 3-cycle counter)
 """LIRIL Hardware Health Telemetry — Capability #8 of the post-NPU plan.
 
 LIRIL (poll 2026-04-19): "Monitors GPU/NPU/thermals/SMART metrics to predict
@@ -90,6 +90,11 @@ GPU_TEMP_CRITICAL  = 95
 CPU_TEMP_HIGH      = 85
 CPU_TEMP_CRITICAL  = 95
 SWAP_PCT_HIGH      = 80.0
+# Grok round 6: stuck-fan cycle counter (STUCK_FAN_CYCLES=3 @ 30s tick = 90s
+# before action) is too slow for a 5070 Ti — the card can thermal-runaway in
+# under 30s at 95°C. This threshold triggers an IMMEDIATE high-severity
+# incident the first time we see fan=0% at ≥ this temp, no counter required.
+GPU_STUCK_FAN_IMMEDIATE_C = 90
 
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 ROOT     = Path(__file__).resolve().parent.parent
@@ -103,7 +108,13 @@ def _utc() -> str:
 
 
 def _db() -> sqlite3.Connection:
-    c = sqlite3.connect(str(DB_PATH), timeout=5)
+    # Grok round 6: Cap#8 writes every 30s and the INSERT happens while Cap#6
+    # may be concurrently reading snapshots for its history. WAL + 15s timeout
+    # prevents the 'database is locked' storm the other capabilities saw.
+    c = sqlite3.connect(str(DB_PATH), timeout=15)
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("PRAGMA synchronous=NORMAL")
+    c.execute("PRAGMA busy_timeout=15000")
     c.execute("""
         CREATE TABLE IF NOT EXISTS snapshots (
             ts       REAL PRIMARY KEY,
@@ -326,17 +337,35 @@ def _evaluate_thresholds(snap: dict) -> list[dict]:
                 "message":  f"GPU{idx} ({g.get('name','')}) temp {t}°C >= {GPU_TEMP_HIGH}°C",
                 "data":     g,
             })
-        # Stuck fan: RPM/pct == 0 while hot
-        if fan is not None and fan <= 0 and t is not None and t > 60:
-            _state_stuck_fan[idx] = _state_stuck_fan.get(idx, 0) + 1
-            if _state_stuck_fan[idx] >= STUCK_FAN_CYCLES:
+        # Stuck fan detection.
+        # Grok round 6 (2026-04-19): 5070 Ti can thermal-runaway in < 30s at
+        # 95°C; a 3-cycle wait (~90s with 30s tick) is too slow. IMMEDIATE
+        # critical incident whenever fan=0 AND temp >= GPU_STUCK_FAN_IMMEDIATE_C
+        # (90°C). Fall back to the cycle counter for the milder
+        # "hot but not runaway" range.
+        if fan is not None and fan <= 0 and t is not None:
+            if t >= GPU_STUCK_FAN_IMMEDIATE_C:
+                # Emergency: do not wait for the cycle counter
                 incidents.append({
-                    "severity": "high",
+                    "severity": "critical",
                     "source":   "hardware_health",
-                    "message":  f"GPU{idx} fan stuck at 0% for {_state_stuck_fan[idx]} cycles at {t}°C",
+                    "message":  (f"GPU{idx} fan stuck at 0% at {t}°C "
+                                 f"(>= {GPU_STUCK_FAN_IMMEDIATE_C}°C immediate override)"),
                     "data":     g,
                 })
-                _state_stuck_fan[idx] = 0  # reset to avoid retrigger storm
+                _state_stuck_fan[idx] = 0  # reset so counter doesn't double-fire
+            elif t > 60:
+                _state_stuck_fan[idx] = _state_stuck_fan.get(idx, 0) + 1
+                if _state_stuck_fan[idx] >= STUCK_FAN_CYCLES:
+                    incidents.append({
+                        "severity": "high",
+                        "source":   "hardware_health",
+                        "message":  f"GPU{idx} fan stuck at 0% for {_state_stuck_fan[idx]} cycles at {t}°C",
+                        "data":     g,
+                    })
+                    _state_stuck_fan[idx] = 0  # reset to avoid retrigger storm
+            else:
+                _state_stuck_fan[idx] = 0
         else:
             _state_stuck_fan[idx] = 0
 
@@ -523,16 +552,17 @@ def main() -> int:
 
     if args.thresholds:
         for k, v in [
-            ("GPU_TEMP_HIGH",     GPU_TEMP_HIGH),
-            ("GPU_TEMP_CRITICAL", GPU_TEMP_CRITICAL),
-            ("CPU_TEMP_HIGH",     CPU_TEMP_HIGH),
-            ("CPU_TEMP_CRITICAL", CPU_TEMP_CRITICAL),
-            ("SWAP_PCT_HIGH",     SWAP_PCT_HIGH),
-            ("STUCK_FAN_CYCLES",  STUCK_FAN_CYCLES),
-            ("SWAP_PRESSURE_CYCLES", SWAP_PRESSURE_CYCLES),
-            ("POLL_INTERVAL_SEC", POLL_INTERVAL_SEC),
+            ("GPU_TEMP_HIGH",             GPU_TEMP_HIGH),
+            ("GPU_TEMP_CRITICAL",         GPU_TEMP_CRITICAL),
+            ("GPU_STUCK_FAN_IMMEDIATE_C", GPU_STUCK_FAN_IMMEDIATE_C),
+            ("CPU_TEMP_HIGH",             CPU_TEMP_HIGH),
+            ("CPU_TEMP_CRITICAL",         CPU_TEMP_CRITICAL),
+            ("SWAP_PCT_HIGH",             SWAP_PCT_HIGH),
+            ("STUCK_FAN_CYCLES",          STUCK_FAN_CYCLES),
+            ("SWAP_PRESSURE_CYCLES",      SWAP_PRESSURE_CYCLES),
+            ("POLL_INTERVAL_SEC",         POLL_INTERVAL_SEC),
         ]:
-            print(f"{k:24s} {v}")
+            print(f"{k:28s} {v}")
         return 0
 
     if args.snapshot:
